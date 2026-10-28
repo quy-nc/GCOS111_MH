@@ -1,0 +1,8 @@
+# Python 3.12 · phiên bản đã chạy thử ngày 2026-10-28
+pandas==3.0.6
+scikit-learn==1.9.1
+underthesea==9.5.0
+iterative-stratification==0.1.9
+joblib==1.6.0
+matplotlib==3.11.2
+gradio==6.30.0                  # chỉ cần cho giao diện web (python main.py app)
