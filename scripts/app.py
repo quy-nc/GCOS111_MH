@@ -5,9 +5,11 @@ Chạy:
     python main.py app --port 7861
     python main.py app --share         # tạo link công khai tạm thời của Gradio (ai có link đều dùng được)
 
-Tab "Một comment": chart điểm khen − không khen của 8 aspect (bar diverging, trục cố định ±5),
+Cả hai tab cùng cơ chế: phân tích 8 aspect rồi ra một kết luận tổng (overall_verdict của 06_predict.py,
+cùng ngưỡng chỉ số khen), hiển thị bằng cùng một thẻ kết luận (verdict_card).
+Tab "Một comment": thẻ kết luận, chart điểm khen − không khen của 8 aspect (bar diverging, trục cố định ±5),
                    bảng chi tiết (lớp, margin, từ ảnh hưởng) trong mục "Bảng chi tiết".
-Tab "File CSV"    : tóm tắt tỉ lệ khen theo aspect (theo nhóm nếu chọn), tải file dự đoán từng dòng.
+Tab "File CSV"    : thẻ kết luận, tóm tắt tỉ lệ khen theo aspect (theo nhóm nếu chọn), tải file dự đoán từng dòng.
 """
 
 import argparse
@@ -178,15 +180,46 @@ def analyze(text: str) -> tuple[str, str]:
     if not text:
         return "<p class='absa-meta'>Nhập một comment để dự đoán.</p>", ""
     P, M, S, R = predict_mod.predict(PIPE, [text])
+    # Cùng cơ chế với tab File CSV: kết luận tổng = overall_verdict trên các aspect của comment này
+    V, ov = predict_mod.comment_verdict(P, S).iloc[0], predict_mod.overall_verdict(P)
     P, M, S, R = P.iloc[0], M.iloc[0], S.iloc[0], R[0]
     norm = prep_frame([extract_template(text)[0]])["comment_norm"][0]
-    n_pos, n_neg = int((P == "pos").sum()), int((P == "non_pos").sum())
+    notes = []
+    # Đếm từ giống analyze_file: dữ liệu train chỉ gồm comment >= 4 từ
+    if len(normalize_absa(extract_template(text)[0]).split()) < 4:
+        notes.append("Comment dưới 4 từ: loại này không có trong dữ liệu train, kết quả kém tin cậy hơn.")
     unsure = [a for a in ASPECTS if P[a] != "none" and M[a] < LOW_MARGIN]
-    warn = (f"<p class='absa-warn'>⚠ Model phân vân (margin &lt; {LOW_MARGIN}) ở: {', '.join(unsure)}.</p>"
-            if unsure else "")
-    head = (f"<p class='absa-meta'>Chuẩn hoá: {html.escape(norm)}<br>"
-            f"Nhắc tới {n_pos + n_neg}/8 aspect · khen {n_pos} · không khen {n_neg}</p>")
-    return head + chart(P, M, S, R) + warn, table(P, M, S, R)
+    if unsure:
+        notes.append(f"Model phân vân (margin < {LOW_MARGIN}) ở: {', '.join(unsure)}, đánh dấu ⚠ trong chart.")
+    notes.append("Model hay bỏ sót lời chê nhẹ nằm trong câu khen (bước 5).")
+    head = f"<p class='absa-meta'>Chuẩn hoá: {html.escape(norm)}</p>"
+    return head + comment_overview(P, S, V, ov, notes) + chart(P, M, S, R), table(P, M, S, R)
+
+
+def comment_overview(P: pd.Series, S: pd.Series, V: pd.Series, ov: dict, notes: list[str]) -> str:
+    """Thẻ kết luận tổng cho một comment, cùng bố cục và ngưỡng với thẻ của file."""
+    pos = S[P == "pos"].sort_values(ascending=False)
+    neg = S[P == "non_pos"].sort_values()
+    counts = {"pos": len(pos), "non_pos": len(neg), "none": len(ASPECTS) - len(pos) - len(neg)}
+    names = {"pos": "khen", "non_pos": "không khen", "none": "không nhắc"}
+    tiles = [("Chỉ số khen", f"{ov['share']:.0%}" if ov["n_mentions"] else "-"),
+             ("Aspect được nhắc", f"{ov['n_pos']} khen / {ov['n_mentions']}"),
+             ("Điểm comment", f"{V['score']:+.2f}" if pd.notna(V["score"]) else "-")]
+
+    def fmt(s: pd.Series) -> str:
+        return ", ".join(f"{a} ({v:+.2f})" for a, v in s.items())
+
+    items = [f"<li><b>Được khen:</b> {fmt(pos) or 'không có'}</li>",
+             f"<li><b>Cần lưu ý:</b> {fmt(neg) or 'không có aspect nào bị chê'}</li>"]
+    unmentioned = [a for a in ASPECTS if P[a] == "none"]
+    if unmentioned:
+        items.append(f"<li><b>Không nhắc:</b> {', '.join(unmentioned)}</li>")
+    items.append(f"<li><b>Nhãn ở bảng từng comment (tab File CSV):</b> {VERDICT[V['verdict']]}</li>")
+    how = ["<b>Điểm comment</b> = trung bình điểm các aspect được nhắc (cùng cột Điểm ở bảng từng comment của tab File CSV).",
+           "<b>Chỉ số khen</b> = số aspect khen / số aspect được nhắc trong comment. Kết luận: ≥ 80% tích cực · "
+           "60–79% khá tích cực · 40–59% trái chiều · &lt; 40% tiêu cực (cùng ngưỡng với kết luận file)."]
+    return verdict_card("", "Kết luận cho comment", ov["label"], tiles, "Aspect của comment", counts, names,
+                        items, how, notes) + "<div style='height:14px'></div>"
 
 
 def read_csv(file) -> pd.DataFrame:
@@ -284,15 +317,35 @@ def stars(df: pd.DataFrame) -> str:
     return f"{r.mean():.1f}★ trung bình (" + ", ".join(f"{k}★: {v}" for k, v in counts.items()) + ")"
 
 
+def verdict_card(source: str, kicker: str, label: str, tiles: list[tuple[str, str]], bar_title: str,
+                 counts: dict[str, int], names: dict[str, str], items: list[str], how: list[str], notes: list[str]) -> str:
+    """Thẻ kết luận tổng dùng chung cho tab Một comment và tab File CSV."""
+    # Màu chấm theo nhãn của OVERALL trong 06_predict.py
+    level = {"Tích cực": "pos", "Khá tích cực, có phàn nàn đáng chú ý": "pos", "Trái chiều": "mixed",
+             "Tiêu cực": "non_pos"}.get(label, "none")
+    n = sum(counts.values()) or 1
+    seg = "".join(f"<span class='ov-seg {k}' style='flex:{c}' title='{names[k]}: {c}'></span>"
+                  for k, c in counts.items() if c)
+    legend = "".join(f"<span><i class='dot {k}'></i>{names[k]} <b>{c}</b> ({c / n:.0%})</span>" for k, c in counts.items())
+    return (
+        "<div class='ov'>" + (f"<div class='ov-src'>{source}</div>" if source else "")
+        + f"<div class='ov-top'><div><div class='ov-k'>{kicker}</div>"
+        f"<div class='ov-verdict'><i class='dot big {level}'></i>{html.escape(label)}</div></div>"
+        + "".join(f"<div class='ov-tile'><div class='ov-k'>{k}</div><div class='ov-v'>{v}</div></div>" for k, v in tiles)
+        + "</div>"
+        f"<div class='ov-k' style='margin-top:14px'>{bar_title}</div><div class='ov-bar'>{seg}</div>"
+        f"<div class='ov-legend'>{legend}</div>"
+        f"<ul class='ov-list'>{''.join(items)}</ul>"
+        "<details class='ov-how'><summary>Cách tính và độ tin cậy</summary><ul>"
+        "<li><b>Điểm của aspect</b> = điểm khen − điểm không khen của SVM (không phải thang 1–10); &gt; 0 là khen.</li>"
+        + "".join(f"<li>{h}</li>" for h in how)
+        + "".join(f"<li>{html.escape(t)}</li>" for t in notes)
+        + "</ul></details></div>")
+
+
 def overview(df: pd.DataFrame, V: pd.DataFrame, ov: dict, notes: list[str], source: str) -> str:
     """Thẻ kết luận tổng cho cả file."""
-    level = {"Tích cực": "pos", "Khá tích cực, có phàn nàn đáng chú ý": "pos", "Trái chiều": "mixed",
-             "Tiêu cực": "non_pos"}.get(ov["label"], "none")
     counts = {k: int((V["verdict"] == k).sum()) for k in VERDICT}
-    n = len(V)
-    seg = "".join(f"<span class='ov-seg {k}' style='flex:{c}' title='{VERDICT[k]}: {c}'></span>"
-                  for k, c in counts.items() if c)
-    legend = "".join(f"<span><i class='dot {k}'></i>{VERDICT[k]} <b>{c}</b> ({c / n:.0%})</span>" for k, c in counts.items())
 
     def fmt(aspects):
         return ", ".join(f"{a} ({ov['rate'][a]:.0%} khen / {int(ov['mentions'][a])} lượt)" for a in aspects)
@@ -301,7 +354,7 @@ def overview(df: pd.DataFrame, V: pd.DataFrame, ov: dict, notes: list[str], sour
     worst = fmt(ov["worst"]) or "không có aspect nào bị chê (trong số aspect đủ lượt nhắc)"
     unmentioned = [a for a in ASPECTS if ov["mentions"][a] == 0]
     score = V["score"].mean()
-    tiles = [("Comment phân tích", f"{n}"),
+    tiles = [("Comment phân tích", f"{len(V)}"),
              ("Chỉ số khen", f"{ov['share']:.0%}" if ov["n_mentions"] else "-"),
              ("Lượt nhắc aspect", f"{ov['n_pos']} khen / {ov['n_mentions']}"),
              ("Điểm TB / comment", f"{score:+.2f}" if pd.notna(score) else "-")]
@@ -311,24 +364,13 @@ def overview(df: pd.DataFrame, V: pd.DataFrame, ov: dict, notes: list[str], sour
         items.append(f"<li><b>Không ai nhắc:</b> {', '.join(unmentioned)}</li>")
     if star:
         items.append(f"<li><b>Số sao trên Shopee:</b> {star}</li>")
-    return (
-        f"<div class='ov'><div class='ov-src'>{source}</div>"
-        f"<div class='ov-top'><div><div class='ov-k'>Kết luận cho file</div>"
-        f"<div class='ov-verdict'><i class='dot big {level}'></i>{html.escape(ov['label'])}</div></div>"
-        + "".join(f"<div class='ov-tile'><div class='ov-k'>{k}</div><div class='ov-v'>{v}</div></div>" for k, v in tiles)
-        + "</div>"
-        f"<div class='ov-k' style='margin-top:14px'>Kết luận từng comment</div><div class='ov-bar'>{seg}</div>"
-        f"<div class='ov-legend'>{legend}</div>"
-        f"<ul class='ov-list'>{''.join(items)}</ul>"
-        "<details class='ov-how'><summary>Cách tính và độ tin cậy</summary><ul>"
-        "<li><b>Điểm của aspect</b> = điểm khen − điểm không khen của SVM (không phải thang 1–10); &gt; 0 là khen.</li>"
-        "<li><b>Điểm comment</b> = trung bình điểm các aspect được nhắc. <b>Kết luận comment</b>: mọi aspect được nhắc đều khen → "
-        "Tích cực; đều không khen → Không tích cực; có cả hai → Trái chiều; không nhắc aspect nào → Không xác định.</li>"
-        "<li><b>Chỉ số khen</b> = lượt khen / lượt nhắc aspect. Kết luận file: ≥ 80% tích cực · 60–79% khá tích cực · "
-        "40–59% trái chiều · &lt; 40% tiêu cực (ngưỡng quy ước của demo).</li>"
-        f"<li>Điểm mạnh / cần lưu ý chỉ xét aspect có ít nhất {predict_mod.MIN_MENTIONS} lượt nhắc.</li>"
-        + "".join(f"<li>{html.escape(t)}</li>" for t in notes)
-        + "</ul></details></div>")
+    how = ["<b>Điểm comment</b> = trung bình điểm các aspect được nhắc. <b>Kết luận comment</b>: mọi aspect được nhắc đều khen → "
+           "Tích cực; đều không khen → Không tích cực; có cả hai → Trái chiều; không nhắc aspect nào → Không xác định.",
+           "<b>Chỉ số khen</b> = lượt khen / lượt nhắc aspect. Kết luận file: ≥ 80% tích cực · 60–79% khá tích cực · "
+           "40–59% trái chiều · &lt; 40% tiêu cực (ngưỡng quy ước của demo, tab Một comment dùng cùng ngưỡng).",
+           f"Điểm mạnh / cần lưu ý chỉ xét aspect có ít nhất {predict_mod.MIN_MENTIONS} lượt nhắc."]
+    return verdict_card(source, "Kết luận cho file", ov["label"], tiles, "Kết luận từng comment", counts, VERDICT,
+                        items, how, notes)
 
 
 def comment_table(texts: pd.Series, P: pd.DataFrame, M: pd.DataFrame, S: pd.DataFrame, V: pd.DataFrame,
